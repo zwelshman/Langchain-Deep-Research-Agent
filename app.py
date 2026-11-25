@@ -65,7 +65,7 @@ Conduct targeted web searches using tavily_search and return well-cited, factual
     }
 
     model = ChatOpenAI(
-        model="z-ai/glm-5.3-flash",
+        model="nvidia/nemotron-3-ultra-550b-a55b:free",
         base_url="https://openrouter.ai/api/v1",
         api_key=os.environ.get("OPENROUTER_API_KEY"),
         temperature=0.1,
