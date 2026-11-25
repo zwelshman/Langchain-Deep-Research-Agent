@@ -196,7 +196,7 @@ The orchestrator will consolidate citations from all sub-agents into the final r
     }
 
     model = ChatOpenAI(
-        model="nvidia/nemotron-3-ultra-550b-a55b:free",
+        model="z-ai/glm-5.3-flash",
         base_url="https://openrouter.ai/api/v1",
         api_key=os.environ.get("OPENROUTER_API_KEY"),
         temperature=0.1,
