@@ -170,7 +170,7 @@ research_sub_agent = {
 
 # Initialize the model with OpenRouter
 model = ChatOpenAI(
-    model="z-ai/glm-5.3-flash",
+    model="nvidia/nemotron-3-ultra-550b-a55b:free",
     base_url="https://openrouter.ai/api/v1",
     api_key=os.environ.get("OPENROUTER_API_KEY"),
     temperature=0.1,
