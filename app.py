@@ -255,6 +255,7 @@ if prompt := st.chat_input("What would you like me to research?"):
         todo_container.markdown(latest_todos_md)
         activity_log = []
         final_response = ""
+        latest_todos = []
 
         # Convert session history into LangChain messages
         lc_messages = [
@@ -285,6 +286,23 @@ if prompt := st.chat_input("What would you like me to research?"):
                         lines.append(f"{icon} `{status.upper()}` — {t.get('content', '')}")
                     latest_todos_md = "\n\n".join(lines)
                     todo_container.markdown(latest_todos_md)
+                    
+                    # Log todo changes to activity (only new changes)
+                    for t in chunk["todos"]:
+                        content = t.get('content', '')
+                        status = t.get("status", "pending")
+                        # Check if this is a new status change
+                        prev = next((x for x in latest_todos if x.get('content') == content), None)
+                        if prev is None:
+                            # New todo added
+                            activity_log.append(f"📝 **Added**: {content}")
+                        elif prev.get("status") != status:
+                            if status == "in_progress":
+                                activity_log.append(f"▶️ **Started**: {content}")
+                            elif status == "completed":
+                                activity_log.append(f"✅ **Completed**: {content}")
+                    latest_todos = chunk["todos"]
+                    activity_container.markdown("\n\n".join(activity_log[-8:]))
 
                 if "files" in chunk and chunk["files"]:
                     for filename in chunk["files"]:
@@ -296,13 +314,26 @@ if prompt := st.chat_input("What would you like me to research?"):
             elif mode == "messages":
                 msg, metadata = chunk
 
-                # Log tool invocations
+                # Log tool invocations with details
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     for tc in msg.tool_calls:
                         name = tc.get("name", "tool")
-                        if name != "write_todos":
+                        args = tc.get("args", {})
+                        if name == "task":
+                            # Sub-agent task - show the description
+                            description = args.get("description", "research task")
+                            activity_log.append(f"🤖 **Sub-agent**: {description}")
+                        elif name == "tavily_search":
+                            # Search query
+                            query = args.get("query", "search")
+                            activity_log.append(f"🔍 **Search**: {query[:80]}{'...' if len(query) > 80 else ''}")
+                        elif name == "write_file":
+                            # File write
+                            path = args.get("path", "file")
+                            activity_log.append(f"📝 **Write**: {path}")
+                        elif name != "write_todos":
                             activity_log.append(f"🔧 Calling **`{name}`**")
-                            activity_container.markdown("\n\n".join(activity_log[-6:]))
+                        activity_container.markdown("\n\n".join(activity_log[-8:]))
 
                 # Stream assistant text tokens from the main model node
                 if (
@@ -314,7 +345,23 @@ if prompt := st.chat_input("What would you like me to research?"):
                     final_response += msg.content
                     answer_container.markdown(final_response + "▌")
 
-        status_box.update(label="✅ Research complete", state="complete", expanded=False)
+                # Capture sub-agent responses (ToolMessage from sub-agent)
+                if isinstance(msg, ToolMessage) and metadata.get("langgraph_node") == "research-agent":
+                    # This is a response from the research sub-agent
+                    content_preview = msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
+                    activity_log.append(f"📄 **Sub-agent result**: {content_preview}")
+                    activity_container.markdown("\n\n".join(activity_log[-8:]))
+
+        # Add completion summary
+        completed_count = sum(1 for t in latest_todos if t.get("status") == "completed")
+        total_count = len(latest_todos)
+        in_progress_count = sum(1 for t in latest_todos if t.get("status") == "in_progress")
+        pending_count = sum(1 for t in latest_todos if t.get("status") == "pending")
+        status_box.update(
+            label=f"✅ Research complete — ✅{completed_count} ⏳{in_progress_count} ⬜{pending_count} (of {total_count})",
+            state="complete",
+            expanded=False
+        )
         answer_container.markdown(final_response)
 
         # Save assistant turn to session state
@@ -336,15 +383,20 @@ if st.session_state.files:
         if name in st.session_state.files
     ]
     if assets:
-        assets.sort(
-            key=lambda name: (
-                getattr(st.session_state.files[name], "updated_at", None)
-                or datetime.min
-            ),
-            reverse=True,
-        )
-        latest_name = assets[0]
-        content = st.session_state.files[latest_name].content
+        # Prefer final_report.md if it exists, otherwise sort by updated_at
+        if "final_report.md" in assets:
+            latest_name = "final_report.md"
+        else:
+            assets.sort(
+                key=lambda name: (
+                    st.session_state.files[name].get("updated_at", datetime.min)
+                    if isinstance(st.session_state.files[name], dict)
+                    else getattr(st.session_state.files[name], "updated_at", datetime.min)
+                ),
+                reverse=True,
+            )
+            latest_name = assets[0]
+        content = st.session_state.files[latest_name]["content"] if isinstance(st.session_state.files[latest_name], dict) else st.session_state.files[latest_name].content
         with st.sidebar:
             st.divider()
             st.subheader("📁 Latest Research Report")
