@@ -1,15 +1,18 @@
 import os
+import uuid
 from datetime import datetime
+from pathlib import Path
 
 import streamlit as st
 from deepagents import create_deep_agent
+from dotenv import load_dotenv
 from langchain.agents.middleware import TodoListMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_openai import ChatOpenAI
+from langfuse import get_client
+from langfuse.langchain import CallbackHandler
 
 from tools.search import tavily_search
-from pathlib import Path
-from dotenv import load_dotenv
 
 # Load environment variables from project root
 load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
@@ -37,11 +40,34 @@ with st.sidebar:
     if tavily_key:
         os.environ["TAVILY_API_KEY"] = tavily_key
 
+    with st.expander("Langfuse Observability", expanded=False):
+        lf_public_key = st.text_input(
+            "Langfuse Public Key",
+            value=os.environ.get("LANGFUSE_PUBLIC_KEY", ""),
+            type="password",
+        )
+        lf_secret_key = st.text_input(
+            "Langfuse Secret Key",
+            value=os.environ.get("LANGFUSE_SECRET_KEY", ""),
+            type="password",
+        )
+        lf_base_url = st.text_input(
+            "Langfuse Base URL",
+            value=os.environ.get("LANGFUSE_BASE_URL", "https://cloud.langfuse.com"),
+        )
+        if lf_public_key:
+            os.environ["LANGFUSE_PUBLIC_KEY"] = lf_public_key
+        if lf_secret_key:
+            os.environ["LANGFUSE_SECRET_KEY"] = lf_secret_key
+        if lf_base_url:
+            os.environ["LANGFUSE_BASE_URL"] = lf_base_url
+
     st.divider()
     if st.button("Clear Conversation"):
         st.session_state.messages = []
         st.session_state.files = {}
         st.session_state.report_order = []
+        st.session_state.session_id = str(uuid.uuid4())
         st.rerun()
 
 # ---------------------------------------------------------------------------
@@ -220,6 +246,8 @@ if "files" not in st.session_state:
     st.session_state.files = {}
 if "report_order" not in st.session_state:
     st.session_state.report_order = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 
 # Render existing chat history
 for msg in st.session_state.messages:
@@ -243,6 +271,20 @@ if prompt := st.chat_input("What would you like me to research?"):
         st.markdown(prompt)
 
     agent = get_agent()
+
+    # Configure Langfuse callback & session metadata if credentials are available
+    callbacks = []
+    if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
+        callbacks.append(CallbackHandler())
+
+    run_config = {
+        "callbacks": callbacks,
+        "run_name": "deep-research-agent",
+        "metadata": {
+            "langfuse_session_id": st.session_state.session_id,
+            "langfuse_tags": ["streamlit", "deep-research"],
+        },
+    }
 
     with st.chat_message("assistant"):
         # Live collapsible container for TodoListMiddleware & Tool Calls
@@ -269,6 +311,7 @@ if prompt := st.chat_input("What would you like me to research?"):
         for mode, chunk in agent.stream(
             {"messages": lc_messages},
             stream_mode=["values", "messages"],
+            config=run_config,
         ):
             # 1. Capture live TodoListMiddleware state & virtual files
             if mode == "values":
@@ -286,15 +329,12 @@ if prompt := st.chat_input("What would you like me to research?"):
                         lines.append(f"{icon} `{status.upper()}` — {t.get('content', '')}")
                     latest_todos_md = "\n\n".join(lines)
                     todo_container.markdown(latest_todos_md)
-                    
-                    # Log todo changes to activity (only new changes)
+
                     for t in chunk["todos"]:
-                        content = t.get('content', '')
+                        content = t.get("content", "")
                         status = t.get("status", "pending")
-                        # Check if this is a new status change
-                        prev = next((x for x in latest_todos if x.get('content') == content), None)
+                        prev = next((x for x in latest_todos if x.get("content") == content), None)
                         if prev is None:
-                            # New todo added
                             activity_log.append(f"📝 **Added**: {content}")
                         elif prev.get("status") != status:
                             if status == "in_progress":
@@ -314,28 +354,25 @@ if prompt := st.chat_input("What would you like me to research?"):
             elif mode == "messages":
                 msg, metadata = chunk
 
-                # Log tool invocations with details
                 if hasattr(msg, "tool_calls") and msg.tool_calls:
                     for tc in msg.tool_calls:
                         name = tc.get("name", "tool")
                         args = tc.get("args", {})
                         if name == "task":
-                            # Sub-agent task - show the description
                             description = args.get("description", "research task")
                             activity_log.append(f"🤖 **Sub-agent**: {description}")
                         elif name == "tavily_search":
-                            # Search query
                             query = args.get("query", "search")
-                            activity_log.append(f"🔍 **Search**: {query[:80]}{'...' if len(query) > 80 else ''}")
+                            activity_log.append(
+                                f"🔍 **Search**: {query[:80]}{'...' if len(query) > 80 else ''}"
+                            )
                         elif name == "write_file":
-                            # File write
                             path = args.get("path", "file")
                             activity_log.append(f"📝 **Write**: {path}")
                         elif name != "write_todos":
                             activity_log.append(f"🔧 Calling **`{name}`**")
                         activity_container.markdown("\n\n".join(activity_log[-8:]))
 
-                # Stream assistant text tokens from the main model node
                 if (
                     isinstance(msg, AIMessage)
                     and msg.content
@@ -345,12 +382,16 @@ if prompt := st.chat_input("What would you like me to research?"):
                     final_response += msg.content
                     answer_container.markdown(final_response + "▌")
 
-                # Capture sub-agent responses (ToolMessage from sub-agent)
                 if isinstance(msg, ToolMessage) and metadata.get("langgraph_node") == "research-agent":
-                    # This is a response from the research sub-agent
-                    content_preview = msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
+                    content_preview = (
+                        msg.content[:200] + "..." if len(msg.content) > 200 else msg.content
+                    )
                     activity_log.append(f"📄 **Sub-agent result**: {content_preview}")
                     activity_container.markdown("\n\n".join(activity_log[-8:]))
+
+        # Flush Langfuse traces immediately at the end of the turn
+        if callbacks:
+            get_client().flush()
 
         # Add completion summary
         completed_count = sum(1 for t in latest_todos if t.get("status") == "completed")
@@ -360,7 +401,7 @@ if prompt := st.chat_input("What would you like me to research?"):
         status_box.update(
             label=f"✅ Research complete — ✅{completed_count} ⏳{in_progress_count} ⬜{pending_count} (of {total_count})",
             state="complete",
-            expanded=False
+            expanded=False,
         )
         answer_container.markdown(final_response)
 
@@ -374,8 +415,27 @@ if prompt := st.chat_input("What would you like me to research?"):
         )
 
 # ---------------------------------------------------------------------------
-# Display the Most Recent Markdown Report Saved by the Deep Agent
+# Display & Download Generated Markdown Reports
 # ---------------------------------------------------------------------------
+def _extract_file_text(file_obj) -> str:
+    content = (
+        file_obj["content"]
+        if isinstance(file_obj, dict)
+        else getattr(file_obj, "content", "")
+    )
+    if isinstance(content, list):
+        return "\n".join(str(line) for line in content)
+    if isinstance(content, bytes):
+        return content.decode("utf-8", errors="replace")
+    return str(content)
+
+
+def _get_modified_ts(file_obj) -> str:
+    if isinstance(file_obj, dict):
+        return str(file_obj.get("modified_at") or file_obj.get("updated_at") or "")
+    return str(getattr(file_obj, "modified_at", "") or getattr(file_obj, "updated_at", ""))
+
+
 if st.session_state.files:
     assets = [
         name
@@ -383,31 +443,32 @@ if st.session_state.files:
         if name in st.session_state.files
     ]
     if assets:
-        # Prefer final_report.md if it exists, otherwise sort by updated_at
-        if "final_report.md" in assets:
-            latest_name = "final_report.md"
-        else:
-            assets.sort(
-                key=lambda name: (
-                    st.session_state.files[name].get("updated_at", datetime.min)
-                    if isinstance(st.session_state.files[name], dict)
-                    else getattr(st.session_state.files[name], "updated_at", datetime.min)
-                ),
-                reverse=True,
-            )
-            latest_name = assets[0]
-        content = st.session_state.files[latest_name]["content"] if isinstance(st.session_state.files[latest_name], dict) else st.session_state.files[latest_name].content
+        # Sort newest first using modified_at, then pin final_report.md to the top
+        assets.sort(
+            key=lambda name: _get_modified_ts(st.session_state.files[name]),
+            reverse=True,
+        )
+        final_reports = [n for n in assets if Path(n).name == "final_report.md"]
+        if final_reports:
+            assets.remove(final_reports[0])
+            assets.insert(0, final_reports[0])
+
         with st.sidebar:
             st.divider()
-            st.subheader("📁 Latest Research Report")
-            file_text = (
-                content
-                if isinstance(content, str)
-                else content.decode("utf-8", errors="replace")
+            st.subheader("📁 Research Files")
+            selected_name = (
+                assets[0]
+                if len(assets) == 1
+                else st.selectbox(
+                    "Select file to download",
+                    options=assets,
+                    format_func=lambda n: Path(n).name,
+                )
             )
+            file_text = _extract_file_text(st.session_state.files[selected_name])
             st.download_button(
-                label=f"Download {Path(latest_name).name}",
+                label=f"Download {Path(selected_name).name}",
                 data=file_text,
-                file_name=Path(latest_name).name,
+                file_name=Path(selected_name).name,
                 mime="text/markdown",
             )
